@@ -1,7 +1,14 @@
-1. download the mat file and put into the fold of matconvnet/mat
-http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat
+1. Download the VGG-NET-19 mat file and put into the model folder using the link
+https://uofi.box.com/shared/static/kxzjhbagd6ih1rf7mjyoxn2hy70hltpl.mat
 
-2. include the path of matconvnet/matlab
+or using the link if you are in China
+http://pan.baidu.com/s/1kU1Me5T 
+
+Note that this mat file is compatile with the MatConvNet 1beta10, if you download that from
+http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat,
+please pay attention to the compatibility.  
+
+2. Include the path of matconvnet/matlab
 
 3. The main entry file run_CF2.m
 
