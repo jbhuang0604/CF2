@@ -4,9 +4,9 @@ https://uofi.box.com/shared/static/kxzjhbagd6ih1rf7mjyoxn2hy70hltpl.mat
 or using the link if you are in China
 http://pan.baidu.com/s/1kU1Me5T 
 
-Note that this mat file is compatile with the MatConvNet 1beta10, if you download that from
+Note that this mat file is compatile with the MatConvNet-1beta10 used in this work, if you download the mat file from
 http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat,
-please pay attention to the compatibility.  
+please pay attention to the version compatibility.  
 
 2. Include the path of matconvnet/matlab
 
