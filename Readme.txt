@@ -10,7 +10,7 @@ please pay attention to the version compatibility.
 
 2. Include the path of matconvnet/matlab
 
-3. The main entry file run_CF2.m
+3. Run the main entry file run_CF2.m
 
 % RUN_CF2:
 % process a sequence using CF2 (Correlation filter tracking with convolutional features)
