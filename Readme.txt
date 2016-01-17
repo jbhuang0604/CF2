@@ -10,9 +10,10 @@ please pay attention to the version compatibility.
 
 2. Include the path of matconvnet/matlab
 
-3. Run the main entry file run_CF2.m
+3. Run the main entry file run_tracker.m
 
-% RUN_CF2:
+% Note that RUN_CF2 is an interfance for OBT-50 and OBT-100:
+%
 % process a sequence using CF2 (Correlation filter tracking with convolutional features)
 %
 % Input:
