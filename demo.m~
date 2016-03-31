@@ -1,0 +1,13 @@
+
+
+addpath('utility','model','cf_scale','external/matconvnet/matlab');
+
+% Path to MatConvNet. Please run external/matconvnet/vl_compilenn.m to
+% set up the MatConvNet
+
+vl_setupnn();
+
+% Note that 
+vl_compilenn();
+
+run_tracker('MotorRolling', 1, 1);

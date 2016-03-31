@@ -23,15 +23,6 @@ function [precision, fps] = run_tracker(video, show_visualization, show_plots)
 %path to the videos (you'll be able to choose one with the GUI).
 base_path   = './data';
 
-addpath('utility');
-addpath('model');
-
-% Path to MatConvNet. Please run external/matconvnet/vl_compilenn.m to
-% set up the MatConvNet
-addpath('external/matconvnet/matlab');
-addpath('external/matconvnet/matlab/mex');
-addpath('external/matconvnet/matlab/xtest');
-
 % Default settings
 if nargin < 1, video = 'choose'; end
 if nargin < 2, show_visualization = ~strcmp(video, 'all'); end
