@@ -1,343 +1,75 @@
-/** @file vl_nnconv.cu
- ** @brief Convolution block
- ** @author Andrea Vedaldi
- **/
+// @file nnconv.cu
+// @brief Convolution block MEX wrapper
+// @author Andrea Vedaldi
+// @author Max Jaderberg
 
 /*
- Copyright (C) 2014 Andrea Vedaldi and Max Jaderberg.
- All rights reserved.
+Copyright (C) 2014 Andrea Vedaldi and Max Jaderberg
+Copyright (C) 2015 Andrea Vedaldi.
 
- This file is part of the VLFeat library and is made available under
- the terms of the BSD license (see the COPYING file).
- */
+All rights reserved.
+
+This file is part of the VLFeat library and is made available under
+the terms of the BSD license (see the COPYING file).
+*/
 
 #include "bits/mexutils.h"
-#include "bits/nnhelper.h"
-#include "bits/im2col.hpp"
-#include "bits/subsample.hpp"
+#include "bits/datamex.hpp"
+#include "bits/nnconv.hpp"
+#include "bits/nnfullyconnected.hpp"
+#include "bits/nnsubsample.hpp"
 
-#include <assert.h>
-
-#include <blas.h>
-#ifdef ENABLE_GPU
-#include <cublas_v2.h>
+#if ENABLE_GPU
+#include "bits/datacu.hpp"
 #endif
+
+#include <memory>
+#include <assert.h>
+#include <math.h>
 
 /* option codes */
 enum {
   opt_stride = 0,
   opt_pad,
+  opt_dilate,
   opt_verbose,
   opt_no_der_data,
   opt_no_der_filters,
   opt_no_der_biases,
+  opt_cudnn,
+  opt_no_cudnn,
+  opt_cudnn_workspace_limit,
+  opt_transpose
 } ;
 
 /* options */
-vlmxOption  options [] = {
-  {"Stride",           1,   opt_stride             },
-  {"Pad",              1,   opt_pad                },
-  {"Verbose",          0,   opt_verbose            },
-  {"NoDerData",        0,   opt_no_der_data        },
-  {"NoDerFilters",     0,   opt_no_der_filters     },
-  {"NoDerBiases",      0,   opt_no_der_biases      },
-  {0,                  0,   0                      }
+VLMXOption  options [] = {
+  {"Stride",                1,   opt_stride                },
+  {"Pad",                   1,   opt_pad                   },
+  {"Dilate",                1,   opt_dilate                },
+  {"Verbose",               0,   opt_verbose               },
+  {"NoDerData",             0,   opt_no_der_data           },
+  {"NoDerFilters",          0,   opt_no_der_filters        },
+  {"NoderBiases",           0,   opt_no_der_biases         },
+  {"Cudnn",                 0,   opt_cudnn                 },
+  {"NoCudnn",               0,   opt_no_cudnn              },
+  {"CudnnWorkSpaceLimit",   1,   opt_cudnn_workspace_limit },
+  {0,                       0,   0                         }
 } ;
 
 /* ---------------------------------------------------------------- */
-/*                                                            Cache */
+/*                                                          Context */
 /* ---------------------------------------------------------------- */
 
-#ifdef ENABLE_GPU
-bool cublasInitialized = false ;
-cublasHandle_t thisCublasHandle ;
-#endif
+vl::MexContext context ;
 
-bool persistentDataInitialized = false ;
-PackedData temp ;
-PackedData allOnes ;
-
+/*
+ Resetting the context here resolves a crash when MATLAB quits and
+ the ~Context function is implicitly called on unloading the MEX file.
+ */
 void atExit()
 {
-  if (persistentDataInitialized) {
-    packed_data_deinit (&temp)  ;
-    packed_data_deinit (&allOnes)  ;
-    persistentDataInitialized = false ;
-  }
-#ifdef ENABLE_GPU
-  if (cublasInitialized) {
-    cublasDestroy(thisCublasHandle) ;
-    cublasInitialized = false ;
-  }
-#endif
-}
-
-/* ---------------------------------------------------------------- */
-/*                                                  Dispatcher func */
-/* ---------------------------------------------------------------- */
-
-static void
-sgemv_dispatch(bool gpuMode,
-               char op,
-               ptrdiff_t m, ptrdiff_t n,
-               float alpha,
-               float const * a, ptrdiff_t lda,
-               float const * x, ptrdiff_t incx,
-               float beta,
-               float * y, ptrdiff_t incy)
-{
-  if (!gpuMode) {
-    sgemv(&op,
-          &m, &n, &alpha,
-          (float*)a, &lda,
-          (float*)x, &incx,
-          &beta,
-          y, &incy) ;
-  } else {
-#ifdef ENABLE_GPU
-    cublasSgemv(thisCublasHandle,
-                (op == 't') ? CUBLAS_OP_T : CUBLAS_OP_N,
-                (int)m, (int)n,
-                &alpha,
-                a, lda,
-                x, (int)incx,
-                &beta,
-                y, (int)incy) ;
-#endif
-  }
-}
-
-static void
-sgemm_dispatch(bool gpuMode,
-               char op1, char op2,
-               ptrdiff_t m, ptrdiff_t n, ptrdiff_t k,
-               float alpha,
-               float const * a, ptrdiff_t lda,
-               float const * b, ptrdiff_t ldb,
-               float beta,
-               float * c, ptrdiff_t ldc)
-{
-  if (!gpuMode) {
-    sgemm(&op1, &op2,
-          &m, &n, &k,
-          &alpha,
-          (float*)a, &lda,
-          (float*)b, &ldb,
-          &beta,
-          c, &ldc) ;
-  } else {
-#ifdef ENABLE_GPU
-    cublasSgemm(thisCublasHandle,
-                (op1 == 't') ? CUBLAS_OP_T : CUBLAS_OP_N,
-                (op2 == 't') ? CUBLAS_OP_T : CUBLAS_OP_N,
-                (int)m, (int)n, (int)k,
-                &alpha,
-                a, (int)lda,
-                b, (int)ldb,
-                &beta,
-                c, (int)ldc);
-#endif
-  }
-}
-
-static void
-copy_dispatch(bool gpuMode,
-              float * dest,
-              float const * src,
-              size_t numElements)
-{
-  if (!gpuMode) {
-    memcpy(dest, src, numElements * sizeof(float)) ;
-  } else {
-#ifdef ENABLE_GPU
-    cudaMemcpy(dest, src, numElements * sizeof(float), cudaMemcpyDeviceToDevice) ;
-#endif
-  }
-}
-
-static void
-subsample_dispatch(bool gpuMode,
-                   float* subsampled,
-                   float const* data,
-                   size_t width,
-                   size_t height,
-                   size_t depth,
-                   size_t strideX,
-                   size_t strideY,
-                   size_t padLeft,
-                   size_t padRight,
-                   size_t padTop,
-                   size_t padBottom)
-{
-  if (!gpuMode) {
-    subsample_cpu(subsampled,
-                  data,
-                  width,
-                  height,
-                  depth,
-                  strideX,
-                  strideY,
-                  padLeft,
-                  padRight,
-                  padTop,
-                  padBottom) ;
-  } else {
-#ifdef ENABLE_GPU
-    subsample_gpu(subsampled,
-                  data,
-                  width,
-                  height,
-                  depth,
-                  strideX,
-                  strideY,
-                  padLeft,
-                  padRight,
-                  padTop,
-                  padBottom) ;
-#endif
-  }
-}
-
-static void
-subsampleBackward_dispatch(bool gpuMode,
-                           float* dzdx,
-                           float const* dzdy,
-                           size_t width,
-                           size_t height,
-                           size_t depth,
-                           size_t strideX,
-                           size_t strideY,
-                           size_t padLeft,
-                           size_t padRight,
-                           size_t padTop,
-                           size_t padBottom)
-{
-  if (!gpuMode) {
-    subsampleBackward_cpu(dzdx,
-                          dzdy,
-                          width,
-                          height,
-                          depth,
-                          strideX,
-                          strideY,
-                          padLeft,
-                          padRight,
-                          padTop,
-                          padBottom) ;
-  } else {
-#ifdef ENABLE_GPU
-    subsampleBackward_gpu(dzdx,
-                          dzdy,
-                          width,
-                          height,
-                          depth,
-                          strideX,
-                          strideY,
-                          padLeft,
-                          padRight,
-                          padTop,
-                          padBottom) ;
-#endif
-  }
-}
-
-
-static void
-im2col_dispatch(bool gpuMode,
-                float* stacked,
-                float const* data,
-                size_t width,
-                size_t height,
-                size_t depth,
-                size_t windowWidth,
-                size_t windowHeight,
-                size_t strideX,
-                size_t strideY,
-                size_t padLeft,
-                size_t padRight,
-                size_t padTop,
-                size_t padBottom)
-{
-  if (!gpuMode) {
-    im2col_cpu<float>(stacked,
-                      data,
-                      width,
-                      height,
-                      depth,
-                      windowWidth,
-                      windowHeight,
-                      strideX,
-                      strideY,
-                      padLeft,
-                      padRight,
-                      padTop,
-                      padBottom) ;
-  } else {
-#ifdef ENABLE_GPU
-    im2col_gpu<float>(stacked,
-                      data,
-                      width,
-                      height,
-                      depth,
-                      windowWidth,
-                      windowHeight,
-                      strideX,
-                      strideY,
-                      padLeft,
-                      padRight,
-                      padTop,
-                      padBottom) ;
-#endif
-  }
-}
-
-static void
-col2im_dispatch(bool gpuMode,
-                float* data,
-                float const* stacked,
-                size_t width,
-                size_t height,
-                size_t depth,
-                size_t windowWidth,
-                size_t windowHeight,
-                size_t strideX,
-                size_t strideY,
-                size_t padLeft,
-                size_t padRight,
-                size_t padTop,
-                size_t padBottom)
-{
-  if (!gpuMode) {
-    col2im_cpu<float>(data,
-                      stacked,
-                      width,
-                      height,
-                      depth,
-                      windowWidth,
-                      windowHeight,
-                      strideX,
-                      strideY,
-                      padLeft,
-                      padRight,
-                      padTop,
-                      padBottom) ;
-  } else {
-#ifdef ENABLE_GPU
-    col2im_gpu<float>(data,
-                      stacked,
-                      width,
-                      height,
-                      depth,
-                      windowWidth,
-                      windowHeight,
-                      strideX,
-                      strideY,
-                      padLeft,
-                      padRight,
-                      padTop,
-                      padBottom) ;
-#endif
-  }
+  context.clear() ;
 }
 
 /* ---------------------------------------------------------------- */
@@ -355,65 +87,28 @@ enum {
 void mexFunction(int nout, mxArray *out[],
                  int nin, mxArray const *in[])
 {
-  /* inputs */
-  PackedData data ;
-  PackedData filters ;
-  PackedData biases ;
-  PackedData derOutput ;
-
-  /* outputs */
-  PackedData output ;
-  PackedData derData  ;
-  PackedData derFilters ;
-  PackedData derBiases ;
-
-  PackedDataGeometry outputGeom ;
-  PackedDataGeometry derDataGeom  ;
-  PackedDataGeometry derFiltersGeom ;
-  PackedDataGeometry derBiasesGeom ;
-  PackedDataGeometry tempGeom ;
-  PackedDataGeometry allOnesGeom ;
-
   int strideX = 1 ;
   int strideY = 1 ;
   int padLeft = 0 ;
   int padRight = 0 ;
   int padTop = 0 ;
   int padBottom = 0 ;
-  int numGroups = 1 ;
+  int dilateY = 1 ;
+  int dilateX = 1 ;
+  int numFilterGroups = 1 ;
 
-#if ENABLE_GPU
-  cublasStatus_t stat;
-  bool gpuMode = false ;
-#else
-  bool const gpuMode = false ;
-#endif
   bool backMode = false ;
   bool hasFilters = false ;
   bool hasBiases = false ;
   bool fullyConnectedMode = false ;
   bool computeDerData = true ;
   bool computeDerFilters = true ;
-  bool computeDerBiases = true ;
+  bool computederBiases = true ;
 
   int verbosity = 0 ;
   int opt ;
   int next = IN_END ;
   mxArray const *optarg ;
-
-  packed_data_init_empty(&data) ;
-  packed_data_init_empty(&filters) ;
-  packed_data_init_empty(&biases) ;
-  packed_data_init_empty(&derOutput) ;
-  packed_data_init_empty(&output) ;
-  packed_data_init_empty(&derData) ;
-  packed_data_init_empty(&derFilters) ;
-  packed_data_init_empty(&derBiases) ;
-  if (!persistentDataInitialized) {
-    packed_data_init_empty(&temp) ;
-    packed_data_init_empty(&allOnes) ;
-    persistentDataInitialized = true ;
-  }
 
   /* -------------------------------------------------------------- */
   /*                                            Check the arguments */
@@ -422,7 +117,7 @@ void mexFunction(int nout, mxArray *out[],
   mexAtExit(atExit) ;
 
   if (nin < 3) {
-    mexErrMsgTxt("There are less than three arguments.") ;
+    vlmxError(VLMXE_IllegalArgument, "There are less than three arguments.") ;
   }
 
   if (nin > 3 && vlmxIsString(in[3],-1)) {
@@ -440,7 +135,7 @@ void mexFunction(int nout, mxArray *out[],
 
       case opt_stride :
         if (!vlmxIsPlainMatrix(optarg,-1,-1)) {
-          mexErrMsgTxt("STRIDE is not a plain matrix.") ;
+          vlmxError(VLMXE_IllegalArgument, "STRIDE is not a plain matrix.") ;
         }
         switch (mxGetNumberOfElements(optarg)) {
           case 1:
@@ -452,13 +147,13 @@ void mexFunction(int nout, mxArray *out[],
             strideX = (int)mxGetPr(optarg)[1] ;
             break ;
           default:
-            mexErrMsgTxt("STRIDE has neither one nor two elements.") ;
+            vlmxError(VLMXE_IllegalArgument, "STRIDE has neither one nor two elements.") ;
         }
         break ;
 
       case opt_pad :
         if (!vlmxIsPlainMatrix(optarg,-1,-1)) {
-          mexErrMsgTxt("PAD is not a plain matrix.") ;
+          vlmxError(VLMXE_IllegalArgument, "PAD is not a plain matrix.") ;
         }
         switch (mxGetNumberOfElements(optarg)) {
           case 1:
@@ -474,194 +169,246 @@ void mexFunction(int nout, mxArray *out[],
             padRight = (int)mxGetPr(optarg)[3] ;
             break ;
           default:
-            mexErrMsgTxt("STRIDE has neither one nor two elements.") ;
+            vlmxError(VLMXE_IllegalArgument, "PAD has neither one nor four elements.") ;
+        }
+        break ;
+
+      case opt_dilate :
+        if (!vlmxIsPlainMatrix(optarg,-1,-1)) {
+          vlmxError(VLMXE_IllegalArgument, "DILATE is not a plain matrix.") ;
+        }
+        switch (mxGetNumberOfElements(optarg)) {
+          case 1:
+            dilateY = (int)mxGetPr(optarg)[0] ;
+            dilateX = dilateY ;
+            break ;
+          case 2:
+            dilateY = (int)mxGetPr(optarg)[0] ;
+            dilateX = (int)mxGetPr(optarg)[1] ;
+            break ;
+          default:
+            vlmxError(VLMXE_IllegalArgument, "DILATE has neither one nor two elements.") ;
         }
         break ;
 
       case opt_no_der_data :
-        computeDerData = VL_FALSE ;
+        computeDerData = false ;
         break ;
 
       case opt_no_der_filters :
-        computeDerFilters = VL_FALSE ;
+        computeDerFilters = false ;
         break ;
 
       case opt_no_der_biases :
-        computeDerBiases = VL_FALSE ;
+        computederBiases = false ;
         break ;
+
+      case opt_no_cudnn :
+#if ENABLE_CUDNN
+        context.getCudaHelper().setCudnnEnabled(false) ;
+#endif
+        break ;
+
+      case opt_cudnn :
+#if ENABLE_CUDNN
+        context.getCudaHelper().setCudnnEnabled(true) ;
+#endif
+        break ;
+
+      case opt_cudnn_workspace_limit :
+      {
+#if ENABLE_CUDNN
+        double x ;
+        if (!vlmxIsScalar(optarg) || (x = mxGetScalar(optarg)) < 0) {
+          vlmxError(VLMXE_IllegalArgument, "CudnnWorkSpaceLimit is not a non-negative scalar.") ;
+        }
+        context.getCudaHelper().setCudnnConvolutionFwdPreference
+        ((x==mxGetInf() ?
+          CUDNN_CONVOLUTION_FWD_PREFER_FASTEST :
+          CUDNN_CONVOLUTION_FWD_SPECIFY_WORKSPACE_LIMIT),
+         (size_t)x) ;
+        context.getCudaHelper().setCudnnConvolutionBwdFilterPreference
+        ((x==mxGetInf() ?
+          CUDNN_CONVOLUTION_BWD_FILTER_PREFER_FASTEST :
+          CUDNN_CONVOLUTION_BWD_FILTER_SPECIFY_WORKSPACE_LIMIT),
+         (size_t)x) ;
+        context.getCudaHelper().setCudnnConvolutionBwdDataPreference
+        ((x==mxGetInf() ?
+          CUDNN_CONVOLUTION_BWD_DATA_PREFER_FASTEST :
+          CUDNN_CONVOLUTION_BWD_DATA_SPECIFY_WORKSPACE_LIMIT),
+         (size_t)x) ;
+        break ;
+#endif
+      }
 
       default: break ;
     }
   }
 
-  packed_data_init_with_array(&data, in[IN_DATA]) ;
-  packed_data_init_with_array(&filters, in[IN_FILTERS]) ;
-  packed_data_init_with_array(&biases, in[IN_BIASES]) ;
-  if (backMode) { packed_data_init_with_array(&derOutput, in[IN_DEROUTPUT]) ; }
+  vl::MexTensor data(context) ;
+  vl::MexTensor filters(context) ;
+  vl::MexTensor biases(context) ;
+  vl::MexTensor derOutput(context) ;
 
-#if ENABLE_GPU
-  gpuMode = (data.mode == matlabGpuArrayWrapper) ;
-  if (gpuMode) {
-    mxInitGPU() ;
-    if (!cublasInitialized) {
-      stat = cublasCreate(&thisCublasHandle) ;
-      if (stat != CUBLAS_STATUS_SUCCESS) {
-        mexErrMsgTxt("Could not initialize cuBLAS.") ;
-      }
-      cublasInitialized = true ;
-    }
-  }
-#endif
+  data.init(in[IN_DATA]) ;
+  data.reshape(4) ;
 
-  hasFilters = filters.geom.numElements > 0 ;
-  hasBiases = biases.geom.numElements > 0 ;
+  filters.init(in[IN_FILTERS]) ;
+  filters.reshape(4) ;
 
-  /* check for GPU/data class consistency */
-  if (hasFilters && ! packed_data_are_compatible(&data, &filters)) {
-    mexErrMsgTxt("DATA and FILTERS are not both CPU or GPU arrays.") ;
-  }
-  if (hasBiases && ! packed_data_are_compatible(&data, &biases)) {
-    mexErrMsgTxt("DATA and BIASES are not both CPU or GPU arrays.") ;
-  }
-  if (backMode && ! packed_data_are_compatible(&data, &derOutput)) {
-    mexErrMsgTxt("DATA and DEROUTPUT are not both CPU or GPU arrays.") ;
-  }
-  if (data.geom.classID != mxSINGLE_CLASS) {
-    mexErrMsgTxt("DATA is not of class SINGLE.");
-  }
-  if (hasFilters && filters.geom.classID != mxSINGLE_CLASS) {
-    mexErrMsgTxt("FILTERS is not of class SINGLE.");
-  }
-  if (hasBiases && (biases.geom.classID != mxSINGLE_CLASS)) {
-    mexErrMsgTxt("BIASES is not of class SINGLE.");
-  }
-  if (backMode && (derOutput.geom.classID != mxSINGLE_CLASS)) {
-    mexErrMsgTxt("DEROUTPUT is not of class SINGLE.");
-  }
-
-  if (strideX < 1 || strideY < 1) {
-    mexErrMsgTxt("At least one element of STRIDE is smaller than one.") ;
-  }
-
-  if (!hasFilters) {
-    /*
-     Specifying empty filters assumes that they act as the
-     identity matrix. Geometrically, emulate this as data.geom.detph
-     fiilters of size 1x1xdata.geom.depth.
-     */
-    filters.geom.width = 1 ;
-    filters.geom.height = 1 ;
-    filters.geom.depth = data.geom.depth ;
-    filters.geom.size = data.geom.depth ;
-  }
-  packed_data_geom_init(&outputGeom,
-                        mxSINGLE_CLASS,
-                        (data.geom.height + (padTop+padBottom) - filters.geom.height)/strideY + 1,
-                        (data.geom.width + (padLeft+padRight) - filters.geom.width)/strideX + 1,
-                        filters.geom.size,
-                        data.geom.size) ;
-
-  /* grouped filters */
-  numGroups = data.geom.depth / filters.geom.depth ;
-
-  /* if the output is 1x1 pixels, then there is no need to actually
-   call im2col as it does not do anything
-   */
-  fullyConnectedMode = (outputGeom.height == 1 &&
-                        outputGeom.width == 1 &&
-                        padTop == 0 &&
-                        padBottom == 0 &&
-                        padLeft == 0 &&
-                        padRight == 0 &&
-                        numGroups == 1) ;
-
-  derDataGeom = data.geom ;
-  derFiltersGeom = filters.geom ;
-  if (hasBiases) {
-    if (fullyConnectedMode) {
-      packed_data_geom_init (&allOnesGeom, mxSINGLE_CLASS,
-                             1, 1,
-                             1, data.geom.size) ;
-    } else {
-      packed_data_geom_init (&allOnesGeom, mxSINGLE_CLASS,
-                             outputGeom.height,
-                             outputGeom.width,
-                             1, 1) ;
-    }
-    derBiasesGeom = biases.geom ;
-  } else {
-    packed_data_geom_init (&allOnesGeom, mxSINGLE_CLASS,
-                           0, 0, 0, 0) ;
-  }
-
-  packed_data_geom_init
-  (&tempGeom,
-   mxSINGLE_CLASS,
-   outputGeom.height,
-   outputGeom.width,
-   filters.geom.height*filters.geom.width*filters.geom.depth*numGroups,
-   1) ;
-
-  if (verbosity > 0) {
-    mexPrintf("vl_nnconv: mode %s; %s\n", gpuMode?"gpu":"cpu", backMode?"backward":"forward") ;
-    mexPrintf("vl_nnconv: stride: [%d %d], pad: [%d %d %d %d], numGroups: %d, has bias: %d, has filters: %d, fully connected: %d\n",
-              strideY, strideX,
-              padTop, padBottom, padLeft, padRight,
-              numGroups, hasBiases, hasFilters, fullyConnectedMode) ;
-    packed_data_geom_display(&data.geom, "vl_nnconv: data") ;
-    if (hasFilters) { packed_data_geom_display(&filters.geom, "vl_nnconv: filters") ; }
-    if (hasBiases) { packed_data_geom_display(&biases.geom, "vl_nnconv: biases") ; }
-    if (backMode) {
-      packed_data_geom_display(&derOutput.geom, "vl_nnconv: derOutput") ;
-      packed_data_geom_display(&derDataGeom, "vl_nnconv: derData") ;
-      if (hasFilters) { packed_data_geom_display(&derFiltersGeom, "vl_nnconv: derFilters") ; }
-      if (hasBiases) { packed_data_geom_display(&derBiasesGeom, "vl_nnconv: derBiases") ; }
-    } else {
-      packed_data_geom_display(&outputGeom, "vl_nnconv: output") ;
-    }
-    packed_data_geom_display(&tempGeom, "vl_nnconv: temp") ;
-    packed_data_geom_display(&temp.geom, "vl_nnconv: temp (cached)") ;
-    packed_data_geom_display(&allOnesGeom, "vl_nnconv: allOnes") ;
-    packed_data_geom_display(&allOnes.geom, "vl_nnconv: allOnes (cached)") ;
-  }
+  biases.init(in[IN_BIASES]) ;
 
   if (backMode) {
-    if (derOutput.geom.height != tempGeom.height ||
-        derOutput.geom.width != tempGeom.width ||
-        derOutput.geom.depth != filters.geom.size ||
-        derOutput.geom.size != data.geom.size)
-    {
-      mexErrMsgTxt("DEROUTPUT dimensions are incompatible with X and FILTERS.") ;
-    }
+    derOutput.init(in[IN_DEROUTPUT]) ;
+    derOutput.reshape(4) ;
   }
 
-  if (numGroups * filters.geom.depth != data.geom.depth) {
-    mexErrMsgTxt("The filter depth does not divide the image depth.") ;
+  hasFilters = !filters.isEmpty() ;
+  hasBiases = !biases.isEmpty() ;
+
+  /* check for GPU/data class consistency */
+  if (hasFilters && ! vl::areCompatible(data, filters)) {
+    vlmxError(VLMXE_IllegalArgument, "DATA and FILTERS do not have compatible formats.") ;
+  }
+  if (hasBiases && ! vl::areCompatible(data, biases)) {
+    vlmxError(VLMXE_IllegalArgument, "DATA and BIASES do not have compatible formats.") ;
+  }
+  if (backMode && ! vl::areCompatible(data, derOutput)) {
+    vlmxError(VLMXE_IllegalArgument, "DATA and DEROUTPUT do not have compatible formats.") ;
   }
 
-  if (filters.geom.size % numGroups != 0) {
-    mexErrMsgTxt("The number of filter groups does not divide the total number of filters.") ;
+  /* basic argument checks */
+  if (strideX < 1 || strideY < 1) {
+    vlmxError(VLMXE_IllegalArgument, "At least one element of STRIDE is smaller than one.") ;
   }
-
   if (padLeft < 0 ||
       padRight < 0 ||
       padTop < 0 ||
       padBottom < 0) {
-    mexErrMsgTxt("An element of PAD is negative.") ;
+    vlmxError(VLMXE_IllegalArgument, "An element of PAD is negative.") ;
+  }
+  if (dilateY < 1 || dilateX < 1) {
+    vlmxError(VLMXE_IllegalArgument, "An element of DILATE is less than one.") ;
+  }
+  if (!hasFilters && (dilateY != 1 || dilateX != 1)) {
+    vlmxError(VLMXE_IllegalArgument, "There are no filters and DILATE is not one.") ;
   }
 
-  if (data.geom.height + (padTop+padBottom) < filters.geom.height ||
-      data.geom.width + (padLeft+padRight) < filters.geom.width) {
-    mexErrMsgTxt("FILTERS are larger than the DATA (including padding).") ;
+  /* Get the filter shape */
+  vl::TensorShape filtersShape(filters) ;
+  int equivalentNumFilters ;
+  if (hasFilters) {
+    if (filtersShape.getHeight() == 0 || filtersShape.getWidth() == 0 || filtersShape.getDepth() == 0) {
+      vlmxError(VLMXE_IllegalArgument, "A dimension of FILTERS is void.") ;
+    }
+    if (data.getHeight() + (padTop+padBottom) < (filters.getHeight() - 1)*dilateY + 1 ||
+        data.getWidth() + (padLeft+padRight) < (filters.getWidth() - 1)*dilateX + 1) {
+      vlmxError(VLMXE_IllegalArgument, "FILTERS are larger than the DATA (including padding).") ;
+    }
+    /* grouped filters */
+    numFilterGroups = data.getDepth() / filters.getDepth() ;
+    if (numFilterGroups * filters.getDepth() != data.getDepth()) {
+      vlmxError(VLMXE_IllegalArgument, "The FILTERS depth does not divide the DATA depth.") ;
+    }
+    if (filters.getSize() % numFilterGroups != 0) {
+      vlmxError(VLMXE_IllegalArgument, "The number of filter groups does not divide the number of filters.") ;
+    }
+    equivalentNumFilters = filters.getSize() ;
+  } else {
+    /* empty filters -> pretend the identity filter bank */
+    filtersShape = vl::TensorShape(1, 1, data.getDepth(), data.getDepth()) ;
+    numFilterGroups = 1 ;
+    equivalentNumFilters = data.getDepth() ;
   }
 
-  if (filters.geom.height == 0 || filters.geom.width == 0 || filters.geom.depth == 0) {
-    mexErrMsgTxt("A dimension of FILTERS is void.") ;
+  /* Get the output shape */
+  int kernelExtentX = (filtersShape.getWidth() - 1)*dilateX + 1 ;
+  int kernelExtentY = (filtersShape.getHeight() - 1)*dilateY + 1 ;
+
+  vl::TensorShape outputShape((data.getHeight() + (padTop+padBottom) - kernelExtentY)/strideY + 1,
+                                (data.getWidth()  + (padLeft+padRight) - kernelExtentX)/strideX + 1,
+                                equivalentNumFilters,
+                                data.getSize()) ;
+
+  if (backMode && (derOutput != outputShape)) {
+    vlmxError(VLMXE_IllegalArgument, "DEROUTPUT dimensions are incompatible with X and FILTERS.") ;
   }
 
+  /* Check the biases sizes */
   if (hasBiases) {
-    if (biases.geom.numElements != filters.geom.size) {
-      mexErrMsgTxt("The number of elements of BIASES is not the same as the number of filters.") ;
+    if (biases.getNumElements() != filtersShape.getSize()) {
+      vlmxError(VLMXE_IllegalArgument, "The number of elements of BIASES is not the same as the number of filters.") ;
+    }
+  }
+
+  /*
+   Detect fully connected mode (further optimisations):
+   the output is 1 x 1 pixels,
+   no padding,
+   one filter group,
+   stride of one pixel
+   */
+  fullyConnectedMode = (outputShape.getHeight() == 1 &&
+                        outputShape.getWidth() == 1 &&
+                        strideY == 1 &&
+                        strideX == 1 &&
+                        padTop == 0 &&
+                        padBottom == 0 &&
+                        padLeft == 0 &&
+                        padRight == 0 &&
+                        dilateY == 1 &&
+                        dilateX == 1 &&
+                        numFilterGroups == 1) ;
+
+  /* create output buffers */
+  vl::DeviceType deviceType = data.getDeviceType() ;
+  vl::DataType dataType = data.getDataType() ;
+  vl::MexTensor output(context) ;
+  vl::MexTensor derData(context) ;
+  vl::MexTensor derFilters(context) ;
+  vl::MexTensor derBiases(context) ;
+
+  if (!backMode) {
+    output.init(deviceType, dataType, outputShape) ;
+  } else {
+    if (computeDerData) {
+      derData.init(deviceType, dataType, data.getShape()) ;
+    }
+    if (computeDerFilters && hasFilters) {
+      derFilters.init(deviceType, dataType, filters.getShape()) ;
+    }
+    if (computederBiases && hasBiases) {
+      derBiases.init(deviceType, dataType, biases.getShape()) ;
+    }
+  }
+
+  if (verbosity > 0) {
+    mexPrintf("vl_nnconv: %s; %s", backMode?"backward":"forward", (data.getDeviceType()==vl::VLDT_GPU) ? "GPU" : "CPU") ;
+    if (data.getDeviceType() == vl::VLDT_GPU) {
+#if ENABLE_CUDNN
+      mexPrintf("; %s\n", context.getCudaHelper().getCudnnEnabled() ? "cuDNN" : "cuBLAS") ;
+#else
+      mexPrintf("; cuBLAS\n") ;
+#endif
+    } else {
+      mexPrintf("; BLAS\n") ;
+    }
+    mexPrintf("vl_nnconv: stride: [%d %d], pad: [%d %d %d %d], dilate: [%d %d]\n"
+              "vl_nnconv: num filter groups: %d, has bias: %d, has filters: %d, is fully connected: %d\n",
+              strideY, strideX,
+              padTop, padBottom, padLeft, padRight,
+              dilateY, dilateX,
+              numFilterGroups, hasBiases, hasFilters, fullyConnectedMode) ;
+    vl::print("vl_nnconv: data: ", data) ;
+    if (hasFilters) { vl::print("vl_nnconv: filters: ", filters) ; }
+    if (hasBiases) { vl::print("vl_nnconv: biases: ", biases) ; }
+    if (backMode) {
+      vl::print("vl_nnconv: derOutput: ", derOutput) ;
+      vl::print("vl_nnconv: derData: ", derData) ;
+      if (hasFilters) { vl::print("vl_nnconv: derFilters: ", derFilters) ; }
+      if (hasBiases) { vl::print("vl_nnconv: derBiases: ", derBiases) ; }
+    } else {
+      vl::print("vl_nnconv: output: ", output) ;
     }
   }
 
@@ -669,279 +416,107 @@ void mexFunction(int nout, mxArray *out[],
   /*                                                    Do the work */
   /* -------------------------------------------------------------- */
 
-  /* auxiliary buffers */
-  if (hasBiases) {
-    if (allOnes.memorySize < allOnesGeom.numElements * sizeof(float) ||
-        (allOnes.mode == matlabGpuArray || allOnes.mode == matlabGpuArrayWrapper) != gpuMode) {
-      packed_data_deinit (&allOnes) ;
-      packed_data_init_with_geom (&allOnes, gpuMode, allOnesGeom, true, true, 1.0f) ;
-    }
-  }
-  if (!fullyConnectedMode) {
-    if (temp.memorySize < tempGeom.numElements * sizeof(float) ||
-        (temp.mode == matlabGpuArray || temp.mode == matlabGpuArrayWrapper) != gpuMode) {
-      packed_data_deinit (&temp) ;
-      packed_data_init_with_geom (&temp, gpuMode, tempGeom, true, false, 0);
-    }
-  }
-  if (!backMode) {
-    packed_data_init_with_geom(&output, gpuMode, outputGeom, false, false, 0) ;
-  } else {
-    if (computeDerData) {
-      packed_data_init_with_geom(&derData, gpuMode, derDataGeom, false, false, 0) ;
-    }
-    if (computeDerFilters && hasFilters) {
-      packed_data_init_with_geom(&derFilters, gpuMode, derFiltersGeom, false, false, 0) ;
-    }
-    if (computeDerBiases && hasBiases) {
-      packed_data_init_with_geom(&derBiases, gpuMode, derBiasesGeom, false, false, 0) ;
-    }
-  }
+  vl::ErrorCode error ;
 
+  /*
+   special case: fully connected
+   (could be done as a regular case, but it is faster this way)
+   */
   if (fullyConnectedMode) {
-    float alpha = 1 ;
-    float beta = 0 ;
-    ptrdiff_t filtersVolume = filters.geom.height*filters.geom.width*filters.geom.depth ;
-    /* note: fullyConnectedMode also guarantees no padding, num filter groups = 1 */
-
-    /* optimise fully-connected mode case */
     if (!backMode) {
-      if (hasFilters) {
-        if (data.geom.size == 1) {
-          /* one image in the stack */
-          sgemv_dispatch(gpuMode, 't',
-                         filtersVolume, filters.geom.size,
-                         alpha,
-                         filters.memory, filtersVolume,
-                         data.memory, 1,
-                         beta,
-                         output.memory, 1) ;
-        } else {
-          /* multiple images in the stack */
-          sgemm_dispatch(gpuMode, 't', 'n',
-                         filters.geom.size, data.geom.size, filtersVolume,
-                         alpha,
-                         filters.memory, filtersVolume,
-                         data.memory, filtersVolume,
-                         beta,
-                         output.memory, filters.geom.size) ;
-        }
-      } else {
-        /* if no filter specified, assume that they act as the
-         identity */
-        copy_dispatch(gpuMode,
-                      output.memory, data.memory,
-                      filtersVolume * data.geom.size) ;
-      }
-      if (hasBiases) {
-        float beta = 1 ;
-        ptrdiff_t q = 1 ;
-        sgemm_dispatch(gpuMode, 'n', 'n',
-                       filters.geom.size, data.geom.size, q,
-                       alpha,
-                       biases.memory, filters.geom.size,
-                       allOnes.memory, q,
-                       beta,
-                       output.memory, filters.geom.size) ;
-      }
+      error = vl::nnfullyconnected_forward(context,
+                                           output,
+                                           data,
+                                           filters,
+                                           biases) ;
     } else {
-      /* back mode */
-      if (computeDerFilters && hasFilters) {
-        sgemm_dispatch(gpuMode, 'n', 't',
-                       filtersVolume, filters.geom.size, data.geom.size,
-                       alpha,
-                       data.memory, filtersVolume,
-                       derOutput.memory, filters.geom.size,
-                       beta,
-                       derFilters.memory, filtersVolume) ;
-      }
-      if (computeDerBiases && hasBiases) {
-        ptrdiff_t q = 1 ;
-        sgemm_dispatch(gpuMode, 'n', 't',
-                       q, filters.geom.size, data.geom.size,
-                       alpha,
-                       allOnes.memory, q,
-                       derOutput.memory, filters.geom.size,
-                       beta,
-                       derBiases.memory, q) ;
-      }
-      if (computeDerData) {
-        if (hasFilters) {
-          sgemm_dispatch(gpuMode, 'n', 'n',
-                         filtersVolume, data.geom.size, filters.geom.size,
-                         alpha,
-                         filters.memory, filtersVolume,
-                         derOutput.memory, filters.geom.size,
-                         beta,
-                         derData.memory, filtersVolume) ;
-        } else {
-          /* does not have filters, just act as identity */
-          copy_dispatch(gpuMode,
-                        derData.memory, derOutput.memory,
-                        filtersVolume * data.geom.size) ;
-        }
-      }
+      error = vl::nnfullyconnected_backward(context,
+                                            derData,
+                                            derFilters,
+                                            derBiases,
+                                            data,
+                                            filters,
+                                            derOutput) ;
     }
-  } else {
-    /* not fully connected */
-    for (int image = 0 ; image < data.geom.size ; ++image) {
-      /*
-       temp (phi(x)): m x k
-       filters, derFilters: k x n (for one group of filters)
-       derOutput (dzdy) : m x n (for one group of filters)
-       res (y) : m x n (for one group of filters)
-       */
-      ptrdiff_t dataOffset = (data.geom.height*data.geom.width*data.geom.depth) * image ;
-      ptrdiff_t outputOffset = (output.geom.height*output.geom.width*output.geom.depth) * image ;
-      ptrdiff_t derDataOffset = (derData.geom.height*derData.geom.width*derData.geom.depth) * image ;
-      ptrdiff_t derOutputOffset = (derOutput.geom.height*derOutput.geom.width*derOutput.geom.depth) * image ;
-      ptrdiff_t m = tempGeom.height * tempGeom.width ; /* num output pixels */
-      ptrdiff_t n = filters.geom.size/numGroups ; /* num filters per group */
-      ptrdiff_t k = filters.geom.height*filters.geom.width*filters.geom.depth ; /* filter volume */
+    goto doneok ;
+  }
 
-      if (backMode) {
-        /* ---------------------------------------------------------- */
-        /*                                              Backward mode */
-        /* ---------------------------------------------------------- */
-
-        /* compute derFilters dz/dF */
-        if (computeDerFilters & hasFilters) {
-          im2col_dispatch(gpuMode,
-                          temp.memory,
-                          data.memory + dataOffset,
-                          data.geom.height, data.geom.width, data.geom.depth,
-                          filters.geom.height, filters.geom.width,
-                          strideY, strideX,
-                          padTop, padBottom, padLeft, padRight) ;
-          for (int g = 0 ; g < numGroups ; ++ g) {
-            ptrdiff_t filterGrpOffset = k * n * g ;
-            ptrdiff_t tempGrpOffset = m * k * g ;
-            ptrdiff_t derOutputGrpOffset = m * n * g ;
-            float alpha = 1 ;
-            float beta = (image > 0) ; /* this saves init. the output array with 0 */
-            sgemm_dispatch(gpuMode, 't', 'n',
-                           k, n, m,
-                           alpha,
-                           (fullyConnectedMode ? data.memory : temp.memory)
-                           + (fullyConnectedMode?dataOffset:0) + tempGrpOffset, m,
-                           derOutput.memory + derOutputOffset + derOutputGrpOffset, m,
-                           beta,
-                           derFilters.memory + filterGrpOffset, k) ;
-          }
-        }
-
-        /* compute derData dz/dbias */
-        if (computeDerBiases & hasBiases) {
-          sgemv_dispatch(gpuMode, 't',
-                         m, filters.geom.size,
-                         1, /* alpha */
-                         derOutput.memory + derOutputOffset, m,
-                         allOnes.memory, 1,
-                         (float)(image > 0), /* beta */
-                         derBiases.memory, 1) ;
-        }
-
-        /* compute derData dz/dx */
-        if (computeDerData) {
-          if (hasFilters) {
-            for (int g = 0 ; g < numGroups ; ++ g) {
-              ptrdiff_t filterGrpOffset = k * n * g ;
-              ptrdiff_t tempGrpOffset = m * k * g ;
-              ptrdiff_t derOutputGrpOffset = m * n * g ;
-              float alpha = 1 ;
-              float beta = fullyConnectedMode ? (g > 0) : 0 ;
-              sgemm_dispatch(gpuMode, 'n', 't',
-                             m, k, n,
-                             alpha,
-                             derOutput.memory + derOutputOffset + derOutputGrpOffset, m,
-                             filters.memory + filterGrpOffset, k,
-                             beta,
-                             (fullyConnectedMode ? derData.memory : temp.memory)
-                             + (fullyConnectedMode ? + derDataOffset : 0) + tempGrpOffset,
-                             m) ;
-            }
-            col2im_dispatch(gpuMode,
-                            derData.memory + derDataOffset,
-                            temp.memory,
-                            data.geom.height, data.geom.width, data.geom.depth,
-                            filters.geom.height, filters.geom.width,
-                            strideY, strideX,
-                            padTop, padBottom, padLeft, padRight) ;
-          } else {
-            /* no filters: identity */
-            subsampleBackward_dispatch(gpuMode,
-                                       derData.memory + derDataOffset,
-                                       derOutput.memory + derOutputOffset,
-                                       data.geom.height, data.geom.width, data.geom.depth,
+  /* special case: no filters = identity filter bank (subsample + bias) */
+  if (!hasFilters) {
+    if (!backMode) {
+      error = vl::nnsubsample_forward(context,
+                                      output,
+                                      data,
+                                      biases,
+                                      strideY, strideX,
+                                      padTop, padBottom, padLeft, padRight) ;
+    } else {
+      error = vl::nnsubsample_backward(context,
+                                       derData,
+                                       derBiases,
+                                       derOutput,
                                        strideY, strideX,
                                        padTop, padBottom, padLeft, padRight) ;
-          }
-        }
-      } else {
-        /* ---------------------------------------------------------- */
-        /*                                               Forward mode */
-        /* ---------------------------------------------------------- */
-        if (hasFilters) {
-          im2col_dispatch(gpuMode,
-                          temp.memory,
-                          data.memory + dataOffset,
-                          data.geom.height, data.geom.width, data.geom.depth,
-                          filters.geom.height, filters.geom.width,
-                          strideY, strideX,
-                          padTop, padBottom, padLeft, padRight) ;
-          for (int g = 0 ; g < numGroups ; ++ g) {
-            ptrdiff_t filterGrpOffset = k * n * g ;
-            ptrdiff_t tempGrpOffset = m * k * g ;
-            ptrdiff_t outputGrpOffset = m * n * g  ;
-            float alpha = 1 ;
-            float beta = 0 ;
-            sgemm_dispatch(gpuMode, 'n', 'n',
-                           m, n, k,
-                           alpha,
-                           (fullyConnectedMode ? data.memory : temp.memory)
-                           + (fullyConnectedMode?dataOffset:0) + tempGrpOffset, m,
-                           filters.memory + filterGrpOffset, k,
-                           beta,
-                           output.memory + outputOffset + outputGrpOffset, m) ;
-          }
-        } else {
-          /* no filters: identity */
-          subsample_dispatch(gpuMode,
-                             output.memory + outputOffset,
-                             data.memory + dataOffset,
-                             data.geom.height, data.geom.width, data.geom.depth,
-                             strideY, strideX,
-                             padTop, padBottom, padLeft, padRight) ;
-        }
-        if (hasBiases) {
-          float alpha = 1 ;
-          float beta = 1 ;
-          ptrdiff_t q = 1 ;
-          sgemm_dispatch(gpuMode, 'n', 'n',
-                         m, biases.geom.numElements, q,
-                         alpha,
-                         allOnes.memory, m,
-                         biases.memory, q,
-                         beta,
-                         output.memory + outputOffset, m) ;
-        }
-      }
     }
+    goto doneok ;
+  }
+
+  /* regular case */
+  if (!backMode) {
+    error = vl::nnconv_forward(context,
+                               output, 0,
+                               data, 1,
+                               filters,
+                               biases,
+                               strideY, strideX,
+                               padTop, padBottom, padLeft, padRight,
+                               dilateY, dilateX) ;
+  } else {
+    error = vl::nnconv_backward(context,
+                                derData,
+                                derFilters,
+                                derBiases,
+                                data,
+                                filters,
+                                derOutput,
+                                strideY, strideX,
+                                padTop, padBottom, padLeft, padRight,
+                                dilateY, dilateX) ;
+  }
+
+doneok:
+  if (verbosity > 0) {
+#if ENABLE_CUDNN
+    if (context.getCudaHelper().getCudnnEnabled()) {
+      mexPrintf("vl_nnconv: cuDNN workspace used: "
+                "fwd %.6g MB"
+                ", bwd filter %.6g MB"
+                ", bwd data %.6g MB\n",
+                (double)context.getCudaHelper().getCudnnConvolutionFwdWorkSpaceUsed() / (1024*1024),
+                (double)context.getCudaHelper().getCudnnConvolutionBwdFilterWorkSpaceUsed() / (1024*1024),
+                (double)context.getCudaHelper().getCudnnConvolutionBwdDataWorkSpaceUsed() / (1024*1024)) ;
+    }
+#endif
   }
 
   /* -------------------------------------------------------------- */
   /*                                                        Cleanup */
   /* -------------------------------------------------------------- */
 
-  packed_data_deinit(&data) ;
-  packed_data_deinit(&filters) ;
-  packed_data_deinit(&biases) ;
+  if (error != vl::VLE_Success) {
+    vlmxError(VLMXE_IllegalArgument, context.getLastErrorMessage().c_str()) ;
+  }
   if (backMode) {
-    packed_data_deinit(&derOutput) ;
-    out[OUT_RESULT] = (computeDerData) ? packed_data_deinit_extracting_array(&derData) : mxCreateDoubleMatrix(0,0,mxREAL) ;
-    out[OUT_DERFILTERS] =(computeDerFilters & hasFilters)? packed_data_deinit_extracting_array(&derFilters) : mxCreateDoubleMatrix(0,0,mxREAL) ;
-    out[OUT_DERBIASES] = (computeDerBiases & hasBiases) ? packed_data_deinit_extracting_array(&derBiases) : mxCreateDoubleMatrix(0,0,mxREAL) ;
+    mxClassID classID ;
+    switch (derOutput.getDataType()) {
+      case vl::VLDT_Float: classID = mxSINGLE_CLASS ; break ;
+      case vl::VLDT_Double: classID = mxDOUBLE_CLASS ; break ;
+      default: abort() ;
+    }
+    out[OUT_RESULT] = (computeDerData) ? derData.relinquish() : mxCreateNumericMatrix(0,0,classID,mxREAL) ;
+    out[OUT_DERFILTERS] = (computeDerFilters & hasFilters)? derFilters.relinquish() : mxCreateNumericMatrix(0,0,classID,mxREAL) ;
+    out[OUT_DERBIASES] = (computederBiases & hasBiases) ? derBiases.relinquish() : mxCreateNumericMatrix(0,0,classID,mxREAL) ;
   } else {
-    out[OUT_RESULT] = packed_data_deinit_extracting_array(&output) ;
+    out[OUT_RESULT] = output.relinquish() ;
   }
 }

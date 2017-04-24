@@ -36,7 +36,7 @@ function [positions, time] = tracker_ensemble(video_path, img_files, pos, target
 % ================================================================================
 
 indLayers = [37, 28, 19];   % The CNN layers Conv5-4, Conv4-4, and Conv3-4 in VGG Net
-nweights  = [1, 0.5, 0.02]; % Weights for combining correlation filter responses
+nweights  = [1, 0.5, 0.25]; % Weights for combining correlation filter responses
 numLayers = length(indLayers);
 
 % Get image size and search window size
@@ -64,12 +64,14 @@ end
 
 % Initialize variables for calculating FPS and distance precision
 time      = 0;
-positions = zeros(numel(img_files), 2);
+rects = zeros(numel(img_files), 4);
 nweights  = reshape(nweights,1,1,[]);
 
 % Note: variables ending with 'f' are in the Fourier domain.
 model_xf     = cell(1, numLayers);
 model_alphaf = cell(1, numLayers);
+
+current_scale_factor=1;
 
 % ================================================================================
 % Start tracking
@@ -90,6 +92,11 @@ for frame = 1:numel(img_files),
         % Predict position
         pos  = predictPosition(feat, pos, indLayers, nweights, cell_size, l1_patch_num, ...
             model_xf, model_alphaf);
+        
+        % Scale estimation
+        current_scale_factor = estimate_scale( rgb2gray(im), pos, current_scale_factor);   
+    else
+        init_scale_para(rgb2gray(im), target_sz, pos);
     end
     
     % ================================================================================
@@ -104,12 +111,17 @@ for frame = 1:numel(img_files),
     % ================================================================================
     % Save predicted position and timing
     % ================================================================================
-    positions(frame,:) = pos;
+    % positions(frame,:) = pos;
+    
+    target_sz_t=target_sz*current_scale_factor;
+    box = [pos([2,1]) - target_sz_t([2,1])/2, target_sz_t([2,1])];
+    rects(frame,:)=box;
+
     time = time + toc();
     
     % Visualization
     if show_visualization,
-        box = [pos([2,1]) - target_sz([2,1])/2, target_sz([2,1])];
+        %box = [pos([2,1]) - target_sz([2,1])/2, target_sz([2,1])];
         stop = update_visualization(frame, box);
         if stop, break, end  %user pressed Esc, stop early
         drawnow
@@ -132,7 +144,8 @@ for ii = 1 : length(indLayers)
     zf = fft2(feat{ii});
     kzf=sum(zf .* conj(model_xf{ii}), 3) / numel(zf);
     
-    res_layer(:,:,ii) = real(fftshift(ifft2(model_alphaf{ii} .* kzf)));  %equation for fast detection
+    temp= real(fftshift(ifft2(model_alphaf{ii} .* kzf)));  %equation for fast detection
+    res_layer(:,:,ii)=temp/max(temp(:));
 end
 
 % Combine responses from multiple layers (see Eqn. 5)

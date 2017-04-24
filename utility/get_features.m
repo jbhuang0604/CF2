@@ -13,8 +13,16 @@ sz_window = size(cos_window);
 
 % Preprocessing
 img = single(im);        % note: [0, 255] range
-img = imResample(img, net.normalization.imageSize(1:2));
-img = img - net.normalization.averageImage;
+img = imResample(img, net.meta.normalization.imageSize(1:2));
+
+average=net.meta.normalization.averageImage;
+
+if numel(average)==3
+    average=reshape(average,1,1,3);
+end
+
+img = bsxfun(@minus, img, average);
+
 if enableGPU, img = gpuArray(img); end
 
 % Run the CNN
@@ -24,6 +32,7 @@ res = vl_simplenn(net,img);
 feat = cell(length(layers), 1);
 
 for ii = 1:length(layers)
+    
     % Resize to sz_window
     if enableGPU
         x = gather(res(layers(ii)).x); 

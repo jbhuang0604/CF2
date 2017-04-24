@@ -93,11 +93,12 @@ switch video
         [img_files, pos, target_sz, ground_truth, video_path] = load_video_info(base_path, video);
         
         % Call tracker function with all the relevant parameters
-        [positions, time] = tracker_ensemble(video_path, img_files, pos, target_sz, ...
+        [rects, time] = tracker_ensemble(video_path, img_files, pos, target_sz, ...
             padding, lambda, output_sigma_factor, interp_factor, ...
             cell_size, show_visualization);
         
         % Calculate and show precision plot, as well as frames-per-second
+        positions=rects(:,[2 1])+rects(:,[4 3])/2;
         precisions = precision_plot(positions, ground_truth, video, show_plots);
         fps = numel(img_files) / time;
         

@@ -1,5 +1,5 @@
 function y = vl_nnnoffset(x, param, dzdy)
-% VL_NNNOFFSET  Adds an offset dependent on the feature norm
+%VL_NNNOFFSET CNN norm-dependent offset.
 %   Y = VL_NNNOFFSET(X, PARAM) subtracts from each element of X the
 %   weighted norm of the feature channels:
 %
@@ -9,9 +9,9 @@ function y = vl_nnnoffset(x, param, dzdy)
 %
 %     L(i,j) = sum_K X(i,j,k)^2
 %
-%   DZDX = VL_NNNOFFSET(X, PARAM, DZDY) computes the derivative of
-%   the network given the derivative DZDY with respect to the output
-%   of this block.
+%   DZDX = VL_NNNOFFSET(X, PARAM, DZDY) computes the derivative of the
+%   block projected onto DZDY. DZDX and DZDY have the same dimensions
+%   as X and Y respectively.
 
 % Copyright (C) 2014 Andrea Vedaldi.
 % All rights reserved.
@@ -20,8 +20,7 @@ function y = vl_nnnoffset(x, param, dzdy)
 % the terms of the BSD license (see the COPYING file).
 
 L = sum(x.^2,3) ;
-L = max(L, single(1e-8)) ;
-param = single(param) ;
+L = max(L, 1e-8) ;
 
 if nargin <= 2
   y = bsxfun(@minus, x, param(1)*L.^param(2)) ;

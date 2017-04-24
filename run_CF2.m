@@ -48,16 +48,13 @@ show_visualization=false;
 % ================================================================================
 % Main entry function for visual tracking
 % ================================================================================
-[positions, time] = tracker_ensemble(video_path, img_files, pos, target_sz, ...
+[rects, time] = tracker_ensemble(video_path, img_files, pos, target_sz, ...
     padding, lambda, output_sigma_factor, interp_factor, ...
     cell_size, show_visualization);
 
 % ================================================================================
 % Return results to benchmark, in a workspace variable
 % ================================================================================
-rects      = [positions(:,2) - target_sz(2)/2, positions(:,1) - target_sz(1)/2];
-rects(:,3) = target_sz(2);
-rects(:,4) = target_sz(1);
 results.type   = 'rect';
 results.res    = rects;
 results.fps    = numel(img_files)/time;

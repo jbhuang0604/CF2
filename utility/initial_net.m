@@ -13,4 +13,6 @@ if enableGPU
     net = vl_simplenn_move(net, 'gpu');
 end
 
+net=vl_simplenn_tidy(net);
+
 end
