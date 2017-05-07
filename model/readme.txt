@@ -1,3 +1,2 @@
-Download the VGG-Net-19 using the link https://uofi.box.com/shared/static/kxzjhbagd6ih1rf7mjyoxn2hy70hltpl.mat
-
-If you are in China, please use this link: http://pan.baidu.com/s/1kU1Me5T 
+Download the VGG-Net-19 model using the link 
+http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-19.mat
