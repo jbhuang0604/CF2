@@ -21,6 +21,14 @@ To exactly reproduce the results reported in our ICCV 2015 paper, please check t
 
 If you find the code and dataset useful in your research, please consider citing:
 
+    @article{Ma-HCFTstar-2017,
+        title={Robust Visual Tracking via Hierarchical Convolutional Features},
+        Author = {Ma, Chao and Huang, Jia-Bin and Yang, Xiaokang and Yang, Ming-Hsuan},
+        journal = {IEEE Transcations on Pattern Analysis and Machine Intelligence},
+        pages={},
+        Year = {2018}
+    }
+
     @inproceedings{Ma-ICCV-2015,
         title={Hierarchical Convolutional Features for Visual Tracking},
         Author = {Ma, Chao and Huang, Jia-Bin and Yang, Xiaokang and Yang, Ming-Hsuan},
